@@ -105,6 +105,8 @@ The library can be queried and configured through the `pfd::settings` class.
 bool pfd::settings::available();
 void pfd::settings::verbose(bool value);
 void pfd::settings::rescan();
+void pfd::settings::owner(void *window);
+void *pfd::settings::owner();
 ```
 
 The return value of `pfd::settings::available()` indicates whether a suitable dialog backend (such
@@ -118,3 +120,8 @@ This is probably only useful for debugging purposes.
 
 Calling `pfd::settings::verbose(true)` may help debug the library. It will output debug information
 to `std::cout` about some operations being performed.
+
+Calling `pfd::settings::owner(window)` sets the native window that dialogs belong to (an `HWND` on
+Windows). A dialog with an owner is modal to it and stays in front of it. Dialogs run on their own
+thread, so without an owner they are not tied to any window of the application. Only used by the
+Win32 backend for now.

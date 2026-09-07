@@ -126,6 +126,12 @@ public:
     static void verbose(bool value);
     static void rescan();
 
+    // The native window the dialogs belong to (an HWND on Windows). A dialog with an
+    // owner is modal to it and stays in front of it. Dialogs run on their own thread,
+    // so without this the owner would be that thread's active window, which is none.
+    static void owner(void *window);
+    static void *owner();
+
 protected:
     explicit settings(bool resync = false);
 
@@ -154,6 +160,9 @@ protected:
 
     // Non-const getter for the static array of flags
     bool &flags(flag in_flag);
+
+private:
+    static void *&owner_storage();
 };
 
 // Internal classes, not to be used by client applications
@@ -465,6 +474,14 @@ static inline bool is_vista()
 
     return VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION | VER_SERVICEPACKMAJOR, mask) != FALSE;
 }
+
+// The window to open dialogs on: the one set through settings::owner(), or failing
+// that the calling thread's active window, as before.
+static inline HWND owner_window()
+{
+    auto window = static_cast<HWND>(settings::owner());
+    return window ? window : GetActiveWindow();
+}
 #endif
 
 // This is necessary until C++20 which will have std::string::ends_with() etc.
@@ -581,6 +598,22 @@ inline void settings::verbose(bool value)
 inline void settings::rescan()
 {
     settings(/* resync = */ true);
+}
+
+inline void *&settings::owner_storage()
+{
+    static void *window = nullptr;
+    return window;
+}
+
+inline void settings::owner(void *window)
+{
+    owner_storage() = window;
+}
+
+inline void *settings::owner()
+{
+    return owner_storage();
 }
 
 // Check whether a program is present using “which”.
@@ -1132,7 +1165,7 @@ inline internal::file_dialog::file_dialog(type in_type,
         OPENFILENAMEW ofn;
         memset(&ofn, 0, sizeof(ofn));
         ofn.lStructSize = sizeof(OPENFILENAMEW);
-        ofn.hwndOwner = GetActiveWindow();
+        ofn.hwndOwner = internal::owner_window();
 
         ofn.lpstrFilter = wfilter_list.c_str();
 
@@ -1444,7 +1477,7 @@ inline std::string internal::file_dialog::select_folder_vista(IFileDialog *ifd, 
     ifd->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
     ifd->SetTitle(m_wtitle.c_str());
 
-    hr = ifd->Show(GetActiveWindow());
+    hr = ifd->Show(internal::owner_window());
     if (SUCCEEDED(hr))
     {
         IShellItem* item;
@@ -1634,7 +1667,7 @@ inline message::message(std::string const &title,
         auto wtitle = internal::str2wstr(title);
         // Apply new visual style (required for all Windows versions)
         new_style_context ctx;
-        *exit_code = MessageBoxW(GetActiveWindow(), wtext.c_str(), wtitle.c_str(), style);
+        *exit_code = MessageBoxW(internal::owner_window(), wtext.c_str(), wtitle.c_str(), style);
         return "";
     });
 
