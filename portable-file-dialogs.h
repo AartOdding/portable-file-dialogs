@@ -21,6 +21,7 @@
 #include <shlobj.h>
 #include <shobjidl.h> // IFileDialog
 #include <shellapi.h>
+#include <commctrl.h> // TaskDialogIndirect
 #include <strsafe.h>
 #include <future>     // std::async
 #include <userenv.h>  // GetUserProfileDirectory()
@@ -48,6 +49,7 @@
 #endif
 
 #include <string>   // std::string
+#include <vector>   // std::vector
 #include <memory>   // std::shared_ptr
 #include <iostream> // std::ostream
 #include <map>      // std::map
@@ -283,6 +285,7 @@ protected:
     std::vector<std::string> desktop_helper() const;
     static std::string buttons_to_name(choice _choice);
     static std::string get_icon_name(icon _icon);
+    static std::string osascript_icon(icon _icon);
 
     std::string powershell_quote(std::string const &str) const;
     std::string osascript_quote(std::string const &str) const;
@@ -362,11 +365,26 @@ public:
             choice _choice = choice::ok_cancel,
             icon _icon = icon::info);
 
+    // A message with buttons named by the caller, shown in the order given. The first one is
+    // the default, and closing the dialog any other way counts as the last one. kdialog can
+    // show at most three. Read the answer with button_index() rather than result().
+    message(std::string const &title,
+            std::string const &text,
+            std::vector<std::string> const &buttons,
+            icon _icon = icon::info);
+
     button result();
+
+    // The index into the buttons given to the constructor of the one that was pressed.
+    int button_index();
 
 private:
     // Some extra logic to map the exit code to button number
     std::map<int, button> m_mappings;
+
+    // The custom buttons, and which of them each exit code means
+    std::vector<std::string> m_buttons;
+    std::map<int, int> m_button_indices;
 };
 
 //
@@ -481,6 +499,34 @@ static inline HWND owner_window()
 {
     auto window = static_cast<HWND>(settings::owner());
     return window ? window : GetActiveWindow();
+}
+
+// Gives a task dialog the icon of the window it is opened on. Without this it shows either no
+// icon or the generic one of the executable.
+static inline HRESULT CALLBACK task_dialog_callback(HWND hwnd, UINT msg, WPARAM, LPARAM, LONG_PTR)
+{
+    if (msg != TDN_CREATED)
+        return S_OK;
+
+    HWND owner = owner_window();
+    if (!owner)
+        return S_OK;
+
+    // A dialog frame has no room for an icon, so the frame is turned into an ordinary one.
+    auto ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_DLGMODALFRAME);
+
+    for (int which : { ICON_SMALL, ICON_BIG })
+    {
+        auto icon = SendMessageW(owner, WM_GETICON, which, 0);
+        if (!icon)
+            icon = GetClassLongPtrW(owner, which == ICON_SMALL ? GCLP_HICONSM : GCLP_HICON);
+        if (icon)
+            SendMessageW(hwnd, WM_SETICON, which, icon);
+    }
+
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    return S_OK;
 }
 #endif
 
@@ -1050,6 +1096,21 @@ inline std::string internal::dialog::get_icon_name(icon _icon)
 #else
             return "information";
 #endif
+    }
+}
+
+// The icon expression for an osascript "display dialog"
+inline std::string internal::dialog::osascript_icon(icon _icon)
+{
+    switch (_icon)
+    {
+        #define PFD_OSX_ICON(n) "alias ((path to library folder from system domain) as text " \
+            "& \"CoreServices:CoreTypes.bundle:Contents:Resources:" n ".icns\")"
+        case icon::warning: return "caution";
+        case icon::error: return "stop";
+        case icon::question: return PFD_OSX_ICON("GenericQuestionMarkIcon");
+        /* case icon::info: */ default: return PFD_OSX_ICON("ToolBarInfo");
+        #undef PFD_OSX_ICON
     }
 }
 
@@ -1738,17 +1799,7 @@ inline message::message(std::string const &title,
         }
         m_mappings[1] = if_cancel;
         m_mappings[256] = if_cancel; // XXX: I think this was never correct
-        script += " with icon ";
-        switch (_icon)
-        {
-            #define PFD_OSX_ICON(n) "alias ((path to library folder from system domain) as text " \
-                "& \"CoreServices:CoreTypes.bundle:Contents:Resources:" n ".icns\")"
-            case icon::info: default: script += PFD_OSX_ICON("ToolBarInfo"); break;
-            case icon::warning: script += "caution"; break;
-            case icon::error: script += "stop"; break;
-            case icon::question: script += PFD_OSX_ICON("GenericQuestionMarkIcon"); break;
-            #undef PFD_OSX_ICON
-        }
+        script += " with icon " + osascript_icon(_icon);
 
         command.push_back("-e");
         command.push_back(script);
@@ -1826,6 +1877,166 @@ inline message::message(std::string const &title,
 
     m_async->start_process(command);
 #endif
+}
+
+inline message::message(std::string const &title,
+                        std::string const &text,
+                        std::vector<std::string> const &buttons,
+                        icon _icon /* = icon::info */)
+  : m_buttons(buttons)
+{
+    if (m_buttons.empty())
+        m_buttons.push_back("OK");
+
+#if _WIN32
+    // Custom buttons get ids from 100 up; the ids below that belong to the standard buttons.
+    for (size_t i = 0; i < m_buttons.size(); ++i)
+        m_button_indices[100 + int(i)] = int(i);
+
+    m_async->start_func([labels = m_buttons, text, title, _icon](int *exit_code) -> std::string
+    {
+        auto wtext = internal::str2wstr(text);
+        auto wtitle = internal::str2wstr(title);
+        std::vector<std::wstring> wlabels;
+        for (auto const &label : labels)
+            wlabels.push_back(internal::str2wstr(label));
+
+        std::vector<TASKDIALOG_BUTTON> td_buttons;
+        for (size_t i = 0; i < wlabels.size(); ++i)
+            td_buttons.push_back({ 100 + int(i), wlabels[i].c_str() });
+
+        TASKDIALOGCONFIG config = {};
+        config.cbSize = sizeof(config);
+        config.hwndParent = internal::owner_window();
+        config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        config.pszWindowTitle = wtitle.c_str();
+        config.pszContent = wtext.c_str();
+        config.cButtons = UINT(td_buttons.size());
+        config.pButtons = td_buttons.data();
+        config.nDefaultButton = 100;
+        config.pfCallback = internal::task_dialog_callback;
+        switch (_icon)
+        {
+            case icon::warning: config.pszMainIcon = TD_WARNING_ICON; break;
+            case icon::error: config.pszMainIcon = TD_ERROR_ICON; break;
+            case icon::question: config.pszMainIcon = nullptr; break;
+            /* case icon::info: */ default: config.pszMainIcon = TD_INFORMATION_ICON; break;
+        }
+
+        // Task dialogs only exist in version 6 of the common controls, and which version
+        // LoadLibrary picks depends on the activation context, so that has to be up first.
+        new_style_context ctx;
+        dll comctl32("comctl32.dll");
+        auto task_dialog = dll::proc<HRESULT WINAPI (TASKDIALOGCONFIG const *, int *, int *, BOOL *)>(comctl32, "TaskDialogIndirect");
+
+        int pressed = IDCANCEL;
+        if (!task_dialog || FAILED(task_dialog(&config, &pressed, nullptr, nullptr)))
+            pressed = IDCANCEL;
+        *exit_code = pressed;
+        return "";
+    });
+
+#elif __EMSCRIPTEN__
+    // A browser can only ask yes or no, so it is the first button against the last one.
+    m_button_indices[0] = 0;
+    m_async->start(EM_ASM_INT(
+    {
+        return window.confirm(UTF8ToString($0)) ? 0 : -1;
+    }, (title + "\n\n" + text).c_str()));
+
+#else
+    auto command = desktop_helper();
+
+    if (is_osascript())
+    {
+        std::string script = "display dialog " + osascript_quote(text) +
+                             " with title " + osascript_quote(title) +
+                             " buttons {";
+        for (size_t i = 0; i < m_buttons.size(); ++i)
+            script += (i ? ", " : "") + osascript_quote(m_buttons[i]);
+        script += "} default button " + osascript_quote(m_buttons.front()) +
+                  " cancel button " + osascript_quote(m_buttons.back()) +
+                  " with icon " + osascript_icon(_icon);
+
+        command.push_back("-e");
+        command.push_back(script);
+    }
+    else if (is_zenity())
+    {
+        // Extra buttons come out right to left, so they go in backwards to keep the order asked for.
+        command.insert(command.end(), { "--question", "--switch" });
+        for (auto it = m_buttons.rbegin(); it != m_buttons.rend(); ++it)
+            command.push_back("--extra-button=" + *it);
+
+        command.insert(command.end(), { "--title", title,
+                                        "--width=300", "--height=0", // sensible defaults
+                                        "--no-markup", // do not interpret text as Pango markup
+                                        "--text", text,
+                                        "--icon-name=dialog-" + get_icon_name(_icon) });
+    }
+    else if (is_kdialog())
+    {
+        // kdialog answers with exit code 0, 1 or 2 for its yes, no and cancel buttons.
+        m_button_indices[0] = 0;
+        m_button_indices[1] = 1;
+        m_button_indices[256] = 1;
+        m_button_indices[2] = 2;
+
+        if (m_buttons.size() == 1)
+        {
+            switch (_icon)
+            {
+                case icon::error: command.push_back("--error"); break;
+                case icon::warning: command.push_back("--sorry"); break;
+                default: command.push_back("--msgbox"); break;
+            }
+        }
+        else
+        {
+            std::string flag = "--";
+            if (_icon == icon::warning || _icon == icon::error)
+                flag += "warning";
+            flag += m_buttons.size() > 2 ? "yesnocancel" : "yesno";
+            command.push_back(flag);
+        }
+
+        command.push_back(text);
+        command.push_back("--title");
+        command.push_back(title);
+
+        // Must be after the above part
+        char const *label_flags[] = { "--yes-label", "--no-label", "--cancel-label" };
+        for (size_t i = 0; i < m_buttons.size() && i < 3; ++i)
+            command.insert(command.end(), { label_flags[i], m_buttons[i] });
+    }
+
+    if (flags(flag::is_verbose))
+        std::cerr << "pfd: " << command << std::endl;
+
+    m_async->start_process(command);
+#endif
+}
+
+inline int message::button_index()
+{
+    int exit_code;
+    auto ret = m_async->result(&exit_code);
+
+    // osascript says "button returned:<label>\n" and zenity says "<label>\n". Compared whole
+    // rather than by suffix, so that "Save" does not match "Don't Save".
+    if (internal::starts_with(ret, "button returned:"))
+        ret = ret.substr(std::string("button returned:").size());
+    while (!ret.empty() && (ret.back() == '\n' || ret.back() == '\r'))
+        ret.pop_back();
+    for (size_t i = 0; i < m_buttons.size(); ++i)
+        if (ret == m_buttons[i])
+            return int(i);
+
+    // Closed without pressing anything counts as the last button
+    int last = int(m_buttons.size()) - 1;
+    if (m_button_indices.count(exit_code) != 0 && m_button_indices[exit_code] < last)
+        return m_button_indices[exit_code];
+    return last;
 }
 
 inline button message::result()
